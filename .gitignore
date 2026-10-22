@@ -1,0 +1,4 @@
+/skills
+/dist/
+*.test
+.DS_Store
