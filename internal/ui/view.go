@@ -39,9 +39,13 @@ func (m *Model) resize() {
 		w, h := max(1, col.width-4), max(1, m.paneH-2)
 		switch col.pane {
 		case sourcesPane:
-			m.sidebar.SetSize(w, max(1, h-2))
+			m.sidebar.SetWidth(w)
+			m.sourceView.SetWidth(w)
+			m.sourceView.SetHeight(max(1, h-2))
 		case skillsPane:
-			m.list.SetSize(w, max(1, h-3))
+			m.list.SetWidth(w)
+			m.skillsView.SetWidth(w)
+			m.skillsView.SetHeight(max(1, h-3))
 			m.search.SetWidth(max(1, w-2))
 		case readerPane:
 			m.reader.SetWidth(w)
@@ -53,6 +57,8 @@ func (m *Model) resize() {
 		m.reader.SetWidth(max(1, m.width-4))
 		m.reader.SetHeight(max(1, m.paneH-6))
 	}
+	m.syncLists()
+	m.setDocument(m.document)
 }
 
 func (m Model) View() tea.View {
@@ -81,7 +87,7 @@ func (m Model) View() tea.View {
 		var content string
 		switch col.pane {
 		case sourcesPane:
-			content = title("Library", m.dark) + "\n\n" + m.sidebar.View()
+			content = title("Library", m.dark) + "\n\n" + m.sourceView.View()
 		case skillsPane:
 			name := m.source()
 			if name == "" {
@@ -102,7 +108,7 @@ func (m Model) View() tea.View {
 				}
 				content += muted(empty, m.dark)
 			} else {
-				content += m.list.View()
+				content += m.skillsView.View()
 			}
 		case readerPane:
 			content = m.readerView(w)

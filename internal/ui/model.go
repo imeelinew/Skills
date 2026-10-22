@@ -11,8 +11,6 @@ import (
 	"charm.land/bubbles/v2/textinput"
 	"charm.land/bubbles/v2/viewport"
 	tea "charm.land/bubbletea/v2"
-	"charm.land/glamour/v2"
-	"charm.land/glamour/v2/styles"
 	"charm.land/lipgloss/v2"
 	"github.com/charmbracelet/x/ansi"
 
@@ -105,6 +103,9 @@ type Model struct {
 	list       list.Model
 	search     textinput.Model
 	reader     viewport.Model
+	sourceView viewport.Model
+	skillsView viewport.Model
+	document   string
 	help       help.Model
 	keys       keys
 	focus      pane
@@ -128,11 +129,16 @@ func New(sources []catalog.Source, home string) *Model {
 	m := &Model{
 		sources: sources, home: home,
 		sidebar: newList(false), list: newList(true), search: input,
-		reader: viewport.New(), help: help.New(), keys: newKeys(),
+		reader: viewport.New(), sourceView: viewport.New(), skillsView: viewport.New(),
+		help: help.New(), keys: newKeys(),
 		focus: skillsPane, dark: true, loading: true,
 	}
-	m.reader.SoftWrap = true
+	// Wrap rendered text once when it changes. Viewport soft wrapping rescans
+	// the entire document on every wheel event, which stalls trackpad bursts.
+	m.reader.SoftWrap = false
 	m.reader.FillHeight = true
+	m.sourceView.FillHeight = true
+	m.skillsView.FillHeight = true
 	m.refreshSources()
 	m.theme()
 	return m
@@ -180,7 +186,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case renderedMsg:
 		if msg.id == m.renderID {
 			m.renderErr = msg.err
-			m.reader.SetContent(msg.content)
+			m.setDocument(msg.content)
 			m.reader.SetYOffset(msg.offset)
 		}
 		return m, nil
@@ -230,6 +236,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "0", "1", "2", "3", "4":
 			m.sidebar.Select(int(msg.String()[0] - '0'))
 			m.filter(m.selectedPath())
+			m.revealSelection(sourcesPane)
 			return m, m.render(false)
 		}
 		if m.focus == readerPane {
@@ -241,6 +248,16 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.reader.GotoBottom()
 				return m, nil
 			}
+		}
+		if m.focus == skillsPane && (msg.String() == "pgup" || msg.String() == "pgdown") {
+			delta := max(1, m.skillsView.Height()/2)
+			if msg.String() == "pgup" {
+				delta = -delta
+			}
+			m.list.Select(max(0, min(len(m.list.Items())-1, m.list.Index()+delta)))
+			m.syncLists()
+			m.revealSelection(skillsPane)
+			return m, m.render(false)
 		}
 	case tea.MouseClickMsg:
 		if msg.Button != tea.MouseLeft {
@@ -257,28 +274,23 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, m.search.Focus()
 			}
 			if col.pane == sourcesPane && msg.Y >= 4 {
-				index := m.sidebar.Paginator.Page*m.sidebar.Paginator.PerPage + msg.Y - 4
+				index := m.sourceView.YOffset() + msg.Y - 4
 				if index < len(m.sidebar.Items()) {
 					m.sidebar.Select(index)
 					m.filter(m.selectedPath())
 				}
 			} else if col.pane == skillsPane && msg.Y >= 5 {
-				index := m.list.Paginator.Page*m.list.Paginator.PerPage + (msg.Y-5)/2
+				index := (m.skillsView.YOffset() + msg.Y - 5) / 2
 				if index < len(m.list.Items()) {
 					m.list.Select(index)
+					m.syncLists()
 				}
 			}
 			return m, m.render(previous == m.selectedPath())
 		}
 		return m, nil
 	case tea.MouseWheelMsg:
-		for _, col := range m.layout {
-			if col.pane == readerPane && msg.X >= col.x && msg.X < col.x+col.width && msg.Y > 1 && msg.Y < m.paneH {
-				var cmd tea.Cmd
-				m.reader, cmd = m.reader.Update(msg)
-				return m, cmd
-			}
-		}
+		m.scroll(msg)
 		return m, nil
 	}
 
@@ -298,12 +310,15 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.sidebar, cmd = m.sidebar.Update(msg)
 		if before != m.sidebar.Index() {
 			m.filter(m.selectedPath())
+			m.revealSelection(sourcesPane)
 			return m, tea.Batch(cmd, m.render(false))
 		}
 	case skillsPane:
 		before := m.selectedPath()
 		m.list, cmd = m.list.Update(msg)
 		if before != m.selectedPath() {
+			m.syncLists()
+			m.revealSelection(skillsPane)
 			return m, tea.Batch(cmd, m.render(false))
 		}
 	case readerPane:
@@ -369,6 +384,8 @@ func (m *Model) filter(previous string) {
 	}
 	m.list.SetItems(items)
 	m.list.Select(selected)
+	m.syncLists()
+	m.revealSelection(skillsPane)
 }
 
 func (m Model) selectedPath() string {
@@ -383,7 +400,7 @@ func (m *Model) render(preserve bool) tea.Cmd {
 	if !ok {
 		m.renderID++
 		m.lastRender = renderKey{}
-		m.reader.SetContent("")
+		m.setDocument("")
 		return nil
 	}
 	body := item.Body
@@ -401,7 +418,7 @@ func (m *Model) render(preserve bool) tea.Cmd {
 	if preserve {
 		offset = m.reader.YOffset()
 	} else {
-		m.reader.SetContent("")
+		m.setDocument("")
 	}
 	id, width, dark := m.renderID, m.reader.Width(), m.dark
 	return func() tea.Msg {
@@ -411,29 +428,6 @@ func (m *Model) render(preserve bool) tea.Cmd {
 		}
 		return renderedMsg{id: id, content: content, err: err, offset: offset}
 	}
-}
-
-func renderMarkdown(body string, width int, dark bool) (string, error) {
-	style := styles.DarkStyleConfig
-	if !dark {
-		style = styles.LightStyleConfig
-	}
-	zero := uint(0)
-	style.Document.Margin = &zero
-	style.Document.BlockPrefix = ""
-	style.Document.BlockSuffix = ""
-	style.H1.BackgroundColor = nil
-	style.H1.Prefix, style.H1.Suffix = "", ""
-	style.H2.Prefix, style.H3.Prefix, style.H4.Prefix = "", "", ""
-	style.H5.Prefix, style.H6.Prefix = "", ""
-	renderer, err := glamour.NewTermRenderer(
-		glamour.WithStyles(style), glamour.WithWordWrap(max(12, width)),
-	)
-	if err != nil {
-		return "", err
-	}
-	content, err := renderer.Render(body)
-	return strings.Trim(content, "\n"), err
 }
 
 func (m *Model) theme() {
@@ -450,7 +444,15 @@ func (m *Model) theme() {
 		target.SetDelegate(d)
 		target.Styles = list.DefaultStyles(m.dark)
 	}
-	m.search.SetStyles(textinput.DefaultStyles(m.dark))
+	input := textinput.DefaultStyles(m.dark)
+	input.Focused.Text = lipgloss.NewStyle().Foreground(p.text)
+	input.Blurred.Text = input.Focused.Text
+	input.Focused.Prompt = lipgloss.NewStyle().Foreground(p.accent)
+	input.Blurred.Prompt = input.Focused.Prompt
+	input.Focused.Placeholder = lipgloss.NewStyle().Foreground(p.muted)
+	input.Blurred.Placeholder = input.Focused.Placeholder
+	input.Cursor.Color = p.text
+	m.search.SetStyles(input)
 	m.help.Styles = help.DefaultStyles(m.dark)
 	m.help.Styles.ShortKey = lipgloss.NewStyle().Foreground(p.text)
 	m.help.Styles.ShortDesc = lipgloss.NewStyle().Foreground(p.muted)
@@ -458,6 +460,7 @@ func (m *Model) theme() {
 	m.help.Styles.FullKey = lipgloss.NewStyle().Foreground(p.text)
 	m.help.Styles.FullDesc = lipgloss.NewStyle().Foreground(p.muted)
 	m.help.Styles.FullSeparator = lipgloss.NewStyle().Foreground(p.border)
+	m.syncLists()
 }
 
 func singleLine(s string) string {
